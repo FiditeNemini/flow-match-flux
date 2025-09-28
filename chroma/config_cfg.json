@@ -1,5 +1,6 @@
 {
     "training": {
+        "device": "auto",
         "master_seed": 0,
         "cache_minibatch": 2,
         "train_minibatch": 1,

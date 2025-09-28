@@ -110,18 +110,34 @@ class ModelConfig:
     t5_max_length: int
 
 
-def setup_distributed(rank, world_size):
+def setup_distributed(rank, world_size, device):
     """Initialize distributed training"""
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
     os.environ["LOCAL_RANK"] = str(rank)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    if device == "cuda":
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        backend = "nccl"
+    else:
+        backend = "gloo"
 
     # Initialize process group
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    if world_size > 1:
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+
+    if device == "cuda":
+        torch.cuda.set_device(rank)
+
+
+def empty_cache(device):
+    """Clears the cache for the specified device."""
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    elif device == "mps":
+        torch.mps.empty_cache()
 
 
 def create_distribution(num_points, device=None):
@@ -331,7 +347,7 @@ def inference_wrapper(
     guidance: int,
     cfg: int,
     prompts: list,
-    rank: int,
+    device: str,
     first_n_steps_wo_cfg: int,
     image_dim=(512, 512),
     t5_max_length=512,
@@ -346,7 +362,7 @@ def inference_wrapper(
     GUIDANCE = guidance
     CFG = cfg
     FIRST_N_STEPS_WITHOUT_CFG = first_n_steps_wo_cfg
-    DEVICE = model.device
+    DEVICE = device
     PROMPT = prompts
 
     T5_MAX_LENGTH = t5_max_length
@@ -356,19 +372,19 @@ def inference_wrapper(
     ae_device = ae.device
     model_device = model.device
     with torch.no_grad():
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=(device != 'cpu')):
             # init random noise
             noise = get_noise(len(PROMPT), HEIGHT, WIDTH, DEVICE, torch.bfloat16, SEED)
             noise, shape = vae_flatten(noise)
-            noise = noise.to(rank)
+            noise = noise.to(device)
             n, c, h, w = shape
-            image_pos_id = prepare_latent_image_ids(n, h, w).to(rank)
+            image_pos_id = prepare_latent_image_ids(n, h, w).to(device)
 
             timesteps = get_schedule(STEPS, noise.shape[1])
 
             model.to("cpu")
             ae.to("cpu")
-            t5.to(rank)  # load t5 to gpu
+            t5.to(device)  # load t5 to gpu
             text_inputs = t5_tokenizer(
                 PROMPT,
                 padding="max_length",
@@ -379,7 +395,7 @@ def inference_wrapper(
                 return_tensors="pt",
             ).to(t5.device)
 
-            t5_embed = t5(text_inputs.input_ids, text_inputs.attention_mask).to(rank)
+            t5_embed = t5(text_inputs.input_ids, text_inputs.attention_mask).to(device)
 
             text_inputs_neg = t5_tokenizer(
                 [""],
@@ -392,15 +408,15 @@ def inference_wrapper(
             ).to(t5.device)
 
             t5_embed_neg = t5(text_inputs_neg.input_ids, text_inputs_neg.attention_mask).to(
-                rank
+                device
             )
 
-            text_ids = torch.zeros((len(PROMPT), T5_MAX_LENGTH, 3), device=rank)
-            neg_text_ids = torch.zeros((len(PROMPT), T5_MAX_LENGTH, 3), device=rank)
+            text_ids = torch.zeros((len(PROMPT), T5_MAX_LENGTH, 3), device=device)
+            neg_text_ids = torch.zeros((len(PROMPT), T5_MAX_LENGTH, 3), device=device)
 
             ae.to("cpu")
             t5.to("cpu")
-            model.to(rank)  # load model to gpu
+            model.to(device)  # load model to gpu
             latent_cfg = denoise_cfg(
                 model,
                 noise,
@@ -419,7 +435,7 @@ def inference_wrapper(
 
             model.to("cpu")
             t5.to("cpu")
-            ae.to(rank)  # load ae to gpu
+            ae.to(device)  # load ae to gpu
             output_image = ae.decode(vae_unflatten(latent_cfg, shape))
 
             # restore back state
@@ -430,12 +446,19 @@ def inference_wrapper(
     return output_image
 
 
-def train_chroma(rank, world_size, debug=False):
+def train_chroma(rank, world_size, device, config_path="training_config.json", debug=False):
     # Initialize distributed training
     if not debug:
-        setup_distributed(rank, world_size)
+        setup_distributed(rank, world_size, device)
 
-    config_data = load_config_from_json("training_config.json")
+    # Determine the target device for this process
+    if device == "cuda":
+        target_device = f"cuda:{rank}"
+    else:
+        target_device = device
+
+
+    config_data = load_config_from_json(config_path)
 
     training_config = TrainingConfig(**config_data["training"])
     inference_config = InferenceConfig(**config_data["inference"])
@@ -586,8 +609,8 @@ def train_chroma(rank, world_size, debug=False):
             # we load and unload vae and t5 here to reduce vram usage
             # think of this as caching on the fly
             # load t5 and vae to GPU
-            ae.to(rank)
-            t5.to(rank)
+            ae.to(target_device)
+            t5.to(target_device)
 
             acc_latents = []
             acc_embeddings = []
@@ -602,7 +625,7 @@ def train_chroma(rank, world_size, debug=False):
                 position=rank,
             ):
                 with torch.no_grad(), torch.autocast(
-                    device_type="cuda", dtype=torch.bfloat16
+                    device_type=device, dtype=torch.bfloat16, enabled=(device != 'cpu')
                 ):
                     # init random noise
                     text_inputs = t5_tokenizer(
@@ -628,31 +651,31 @@ def train_chroma(rank, world_size, debug=False):
                     acc_mask.append(text_inputs.attention_mask)
 
                     # flush
-                    torch.cuda.empty_cache()
+                    empty_cache(device)
                     latents = ae.encode_for_train(
                         images[
                             mb_i
                             * training_config.cache_minibatch : mb_i
                             * training_config.cache_minibatch
                             + training_config.cache_minibatch
-                        ].to(rank)
+                        ].to(target_device)
                     ).to("cpu", non_blocking=True)
                     acc_latents.append(latents)
 
                     # flush
-                    torch.cuda.empty_cache()
+                    empty_cache(device)
 
             # accumulate the latents and embedding in a variable
             # unload t5 and vae
 
             t5.to("cpu")
             ae.to("cpu")
-            torch.cuda.empty_cache()
+            empty_cache(device)
             if not debug:
                 dist.barrier()
 
             # move model to device
-            model.to(rank)
+            model.to(target_device)
 
             acc_latents = torch.cat(acc_latents, dim=0)
             acc_embeddings = torch.cat(acc_embeddings, dim=0)
@@ -660,7 +683,7 @@ def train_chroma(rank, world_size, debug=False):
 
             # process the cache buffer now!
             with torch.no_grad(), torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16
+                device_type=device, dtype=torch.bfloat16, enabled=(device != 'cpu')
             ):
                 # prepare flat image and the target lerp
                 (
@@ -669,19 +692,19 @@ def train_chroma(rank, world_size, debug=False):
                     input_timestep,
                     image_pos_id,
                     latent_shape,
-                ) = prepare_sot_pairings(acc_latents.to(rank))
+                ) = prepare_sot_pairings(acc_latents.to(target_device))
                 noisy_latents = noisy_latents.to(torch.bfloat16)
                 target = target.to(torch.bfloat16)
                 input_timestep = input_timestep.to(torch.bfloat16)
-                image_pos_id = image_pos_id.to(rank)
+                image_pos_id = image_pos_id.to(target_device)
 
                 # t5 text id for the model
-                text_ids = torch.zeros((noisy_latents.shape[0], 512, 3), device=rank)
+                text_ids = torch.zeros((noisy_latents.shape[0], 512, 3), device=target_device)
                 # NOTE:
                 # using static guidance 1 for now
                 # this should be disabled later on !
                 static_guidance = torch.tensor(
-                    [0.0] * acc_latents.shape[0], device=rank
+                    [0.0] * acc_latents.shape[0], device=target_device
                 )
 
             # set the input to requires grad to make autograd works
@@ -699,28 +722,28 @@ def train_chroma(rank, world_size, debug=False):
                 position=rank,
             ):
                 # do this inside for loops!
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=(device != 'cpu')):
                     pred = model(
                         img=noisy_latents[tmb_i * mb : tmb_i * mb + mb].to(
-                            rank, non_blocking=True
+                            target_device, non_blocking=True
                         ),
                         img_ids=image_pos_id[tmb_i * mb : tmb_i * mb + mb].to(
-                            rank, non_blocking=True
+                            target_device, non_blocking=True
                         ),
                         txt=acc_embeddings[tmb_i * mb : tmb_i * mb + mb].to(
-                            rank, non_blocking=True
+                            target_device, non_blocking=True
                         ),
                         txt_ids=text_ids[tmb_i * mb : tmb_i * mb + mb].to(
-                            rank, non_blocking=True
+                            target_device, non_blocking=True
                         ),
                         txt_mask=acc_mask[tmb_i * mb : tmb_i * mb + mb].to(
-                            rank, non_blocking=True
+                            target_device, non_blocking=True
                         ),
                         timesteps=input_timestep[tmb_i * mb : tmb_i * mb + mb].to(
-                            rank, non_blocking=True
+                            target_device, non_blocking=True
                         ),
                         guidance=static_guidance[tmb_i * mb : tmb_i * mb + mb].to(
-                            rank, non_blocking=True
+                            target_device, non_blocking=True
                         ),
                     )
                     # TODO: need to scale the loss with rank count and grad accum!
@@ -745,7 +768,7 @@ def train_chroma(rank, world_size, debug=False):
                     #     pred,
                     #     target[tmb_i * mb : tmb_i * mb + mb],
                     # ) / (dataloader_config.batch_size // mb)
-                torch.cuda.empty_cache()
+                empty_cache(device)
                 loss.backward()
                 loss_log.append(
                     loss.detach().clone() * (dataloader_config.batch_size // mb)
@@ -754,14 +777,14 @@ def train_chroma(rank, world_size, debug=False):
             # offload some params to cpu just enough to make room for the caching process
             # and only offload non trainable params
             del acc_embeddings, noisy_latents, acc_latents
-            torch.cuda.empty_cache()
+            empty_cache(device)
             offload_param_count = 0
             for name, param in model.named_parameters():
                 if not any(keyword in name for keyword in trained_layer_keywords):
                     if offload_param_count < training_config.offload_param_count:
                         offload_param_count += param.numel()
                         param.data = param.data.to("cpu", non_blocking=True)
-            optimizer_state_to(optimizer, rank)
+            optimizer_state_to(optimizer, target_device)
 
             StochasticAccumulator.reassign_grad_buffer(model)
 
@@ -778,7 +801,7 @@ def train_chroma(rank, world_size, debug=False):
                 run.track(training_config.lr, name='learning_rate', step=global_step)
 
             optimizer_state_to(optimizer, "cpu")
-            torch.cuda.empty_cache()
+            empty_cache(device)
 
             if (counter + 1) % training_config.save_every == 0 and rank == 0:
                 model_filename = f"{training_config.save_folder}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pth"
@@ -798,112 +821,64 @@ def train_chroma(rank, world_size, debug=False):
 
             if (counter + 1) % inference_config.inference_every == 0:
                 all_grids = []
-
                 preview_prompts = inference_config.prompts + caption[:1]
 
                 for prompt in preview_prompts:
                     images_tensor = inference_wrapper(
-                        model=model,
-                        ae=ae,
-                        t5_tokenizer=t5_tokenizer,
-                        t5=t5,
+                        model=model, ae=ae, t5_tokenizer=t5_tokenizer, t5=t5,
                         seed=training_config.master_seed + rank,
                         steps=inference_config.steps,
                         guidance=inference_config.guidance,
                         cfg=inference_config.cfg,
-                        prompts=[prompt],  # Pass single prompt as a list
-                        rank=rank,
+                        prompts=[prompt],
+                        device=target_device,
                         first_n_steps_wo_cfg=inference_config.first_n_steps_wo_cfg,
                         image_dim=inference_config.image_dim,
                         t5_max_length=inference_config.t5_max_length,
                     )
-
-                    # gather from all gpus
-                    if not debug:
-                        gather_list = (
-                            [torch.empty_like(images_tensor) for _ in range(world_size)]
-                            if rank == 0
-                            else None
-                        )
+                    if world_size > 1:
+                        gather_list = [torch.empty_like(images_tensor) for _ in range(world_size)] if rank == 0 else None
                         dist.gather(images_tensor, gather_list=gather_list, dst=0)
+                        if rank == 0:
+                            images_tensor = torch.cat(gather_list, dim=0)
 
                     if rank == 0:
-                        # Concatenate gathered tensors
-                        if not debug:
-                            gathered_images = torch.cat(
-                                gather_list, dim=0
-                            )  # (total_images, C, H, W)
-                        else:
-                            gathered_images = images_tensor
-
-                        # Create a grid for this prompt
-                        grid = make_grid(
-                            gathered_images.clamp(-1, 1).add(1).div(2),
-                            nrow=8,
-                            normalize=True,
-                        )  # Adjust nrow as needed
+                        grid = make_grid(images_tensor.clamp(-1, 1).add(1).div(2), nrow=8, normalize=True)
                         all_grids.append(grid)
 
                 for extra_inference in extra_inference_config:
                     for prompt in preview_prompts:
                         images_tensor = inference_wrapper(
-                            model=model,
-                            ae=ae,
-                            t5_tokenizer=t5_tokenizer,
-                            t5=t5,
+                            model=model, ae=ae, t5_tokenizer=t5_tokenizer, t5=t5,
                             seed=training_config.master_seed + rank,
                             steps=extra_inference.steps,
                             guidance=extra_inference.guidance,
                             cfg=extra_inference.cfg,
-                            prompts=[prompt],  # Pass single prompt as a list
-                            rank=rank,
+                            prompts=[prompt],
+                            device=target_device,
                             first_n_steps_wo_cfg=extra_inference.first_n_steps_wo_cfg,
                             image_dim=extra_inference.image_dim,
                             t5_max_length=extra_inference.t5_max_length,
                         )
-
-                        # gather from all gpus
-                        if not debug:
-                            gather_list = (
-                                [
-                                    torch.empty_like(images_tensor)
-                                    for _ in range(world_size)
-                                ]
-                                if rank == 0
-                                else None
-                            )
+                        if world_size > 1:
+                            gather_list = [torch.empty_like(images_tensor) for _ in range(world_size)] if rank == 0 else None
                             dist.gather(images_tensor, gather_list=gather_list, dst=0)
+                            if rank == 0:
+                                images_tensor = torch.cat(gather_list, dim=0)
 
                         if rank == 0:
-                            # Concatenate gathered tensors
-                            if not debug:
-                                gathered_images = torch.cat(
-                                    gather_list, dim=0
-                                )  # (total_images, C, H, W)
-                            else:
-                                gathered_images = images_tensor
-
-                            # Create a grid for this prompt
-                            grid = make_grid(
-                                gathered_images.clamp(-1, 1).add(1).div(2),
-                                nrow=8,
-                                normalize=True,
-                            )  # Adjust nrow as needed
+                            grid = make_grid(images_tensor.clamp(-1, 1).add(1).div(2), nrow=8, normalize=True)
                             all_grids.append(grid)
 
-                # send prompt to rank 0
-                if rank != 0:
-                    dist.send_object_list(caption[:1], dst=0)
-
-                else:
-                    all_prompt = []
-                    # Rank 0 receives from all other ranks
-                    for src_rank in range(1, world_size):
-                        # Initialize empty list with the same size to receive strings
-                        received_strings = [None]
-                        # Receive the list of strings
-                        dist.recv_object_list(received_strings, src=src_rank)
-                        all_prompt.extend(received_strings)
+                if world_size > 1:
+                    if rank != 0:
+                        dist.send_object_list(caption[:1], dst=0)
+                    else:
+                        all_prompt = []
+                        for src_rank in range(1, world_size):
+                            received_strings = [None]
+                            dist.recv_object_list(received_strings, src=src_rank)
+                            all_prompt.extend(received_strings)
 
                 if rank == 0:
                     # Combine all grids vertically
