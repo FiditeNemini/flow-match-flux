@@ -19,6 +19,21 @@ log = logging.getLogger(__name__)
 
 
 def load_file_multipart(base_folder, device=None):
+    """
+    Loads a model that has been sharded into multiple .safetensors files.
+
+    This function reads an index file (`model.safetensors.index.json`) to understand the sharding
+    and then loads all individual .safetensors files from the specified folder into a single
+    state dictionary.
+
+    Args:
+        base_folder (str): The directory containing the sharded model files and the index file.
+        device (str, optional): The device to load the tensors onto (e.g., "cpu", "cuda").
+                                Defaults to None, which typically means CPU.
+
+    Returns:
+        dict: A state dictionary containing all the tensors from the sharded model.
+    """
     state_dict = {}
     with open(os.path.join(base_folder, "model.safetensors.index.json")) as f:
         index = json.load(f)
@@ -47,6 +62,25 @@ def load_file_multipart(base_folder, device=None):
 def save_file_multipart(
     state_dict, base_folder, metadata=None, num_shards=2, _json_index_only=False
 ):
+    """
+    Saves a state dictionary into multiple .safetensors files (shards).
+
+    This function splits a given state dictionary into a specified number of shards,
+    saves each shard as a separate .safetensors file, and creates an index JSON file
+    that maps tensor names to their respective files.
+
+    Args:
+        state_dict (dict): The state dictionary to be saved.
+        base_folder (str): The directory where the sharded files will be saved.
+        metadata (dict, optional): Additional metadata to include in the index JSON file. Defaults to None.
+        num_shards (int, optional): The number of shards to create. Defaults to 2.
+        _json_index_only (bool, optional): If True, only the index JSON file is created without
+                                           saving the actual tensor files. Used for testing/debugging.
+                                           Defaults to False.
+
+    Returns:
+        int: The number of shards created.
+    """
     if not os.path.exists(base_folder):
         os.makedirs(base_folder)
 
@@ -83,6 +117,17 @@ def save_file_multipart(
 
 
 def load_safetensors(file_path: str, device: str = "cpu"):
+    """
+    Loads all tensors from a single .safetensors file.
+
+    Args:
+        file_path (str): The path to the .safetensors file.
+        device (str, optional): The device to load the tensors onto (e.g., "cpu", "cuda").
+                                Defaults to "cpu".
+
+    Returns:
+        dict: A state dictionary containing all the tensors from the file.
+    """
     statedict = {}
 
     with safe_open(file_path, framework="pt", device=device) as f:
@@ -94,16 +139,17 @@ def load_safetensors(file_path: str, device: str = "cpu"):
 
 
 def load_selected_keys(filename, exclude_keywords=[]):
-    """Loads all keys from a safetensors file except those containing specified keywords.
+    """
+    Loads all keys from a safetensors file except those containing specified keywords.
 
     Args:
-        filename: Path to the safetensors file.
-        exclude_keywords: List of keywords to exclude.
+        filename (str): Path to the safetensors file.
+        exclude_keywords (list[str]): A list of keywords. Any key containing one of these
+                                      keywords will be excluded from loading.
 
     Returns:
-        A dictionary containing the loaded tensors.
+        dict: A dictionary containing the loaded tensors that do not match the exclude keywords.
     """
-
     tensors = {}
     with safe_open(filename, framework="pt") as f:
         for key in f.keys():
@@ -119,16 +165,21 @@ def load_layers_by_keywords_from_safetensors(
     device: str = "cpu",
 ):
     """
-    Load specific layers from a .safetensors file based on keyword lists, including and excluding layers.
+    Load specific layers from a .safetensors file based on inclusion and exclusion keywords.
+
+    This function iterates through all tensor keys in the file and loads only those that
+    contain at least one of the `include_keywords` and none of the `exclude_keywords`.
 
     Args:
         file_path (str): Path to the .safetensors file.
-        include_keywords (list[str]): List of keywords to include in the search.
-        exclude_keywords (list[str], optional): List of keywords to exclude from the search. Defaults to None.
-        device (str): Device to load the tensors onto (e.g., "cpu" or "cuda").
+        include_keywords (list[str]): List of keywords to identify which layers to include.
+        exclude_keywords (list[str], optional): List of keywords to identify which layers to exclude.
+                                                Defaults to None.
+        device (str, optional): Device to load the tensors onto (e.g., "cpu", "cuda").
+                                Defaults to "cpu".
 
     Returns:
-        dict: A dictionary with layers that contain at least one include keyword and none of the exclude keywords in their names.
+        dict: A dictionary containing the state dicts of the layers that were loaded.
     """
     matched_layers_state_dict = {}
 

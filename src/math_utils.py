@@ -38,7 +38,22 @@ def cosine_optimal_transport(X, Y, backend="auto"):
 
 
 def _cuda_assignment(C):
-    """Use the CUDA implementation for assignment"""
+    """
+    Solves the linear assignment problem using a CUDA-accelerated implementation.
+
+    This function requires the `torch_linear_assignment` library to be installed.
+    It takes a cost matrix and finds the optimal assignment (matching) of rows to
+    columns that minimizes the total cost.
+
+    Args:
+        C (torch.Tensor): A 2D cost matrix of shape (n, m).
+
+    Returns:
+        tuple: A tuple containing:
+            - C (torch.Tensor): The original cost matrix.
+            - matching_pairs (tuple[torch.Tensor, torch.Tensor]): A tuple containing
+              the row and column indices of the optimal assignment.
+    """
     from torch_linear_assignment import batch_linear_assignment
     from torch_linear_assignment import assignment_to_indices
 
@@ -50,7 +65,21 @@ def _cuda_assignment(C):
 
 
 def _scipy_assignment(C):
-    """Use the SciPy implementation for assignment"""
+    """
+    Solves the linear assignment problem using the SciPy library (Hungarian algorithm).
+
+    This function serves as a fallback when a CUDA implementation is not available.
+    It converts the tensor to a NumPy array to use `scipy.optimize.linear_sum_assignment`.
+
+    Args:
+        C (torch.Tensor): A 2D cost matrix of shape (n, m).
+
+    Returns:
+        tuple: A tuple containing:
+            - C (torch.Tensor): The original cost matrix.
+            - matching_pairs (tuple[torch.Tensor, torch.Tensor]): A tuple containing
+              the row and column indices of the optimal assignment, converted back to tensors.
+    """
     from scipy.optimize import linear_sum_assignment
 
     # Convert to numpy for scipy
